@@ -1,0 +1,25 @@
+services:
+  charter:
+    build: .
+    image: club-charter-revision:latest
+    container_name: club-charter-revision
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # 容器内监听地址/端口（一般无需修改）
+      PORT: "3000"
+      # 容器内 SQLite 数据库文件路径
+      DB_PATH: /data/charter.db
+    volumes:
+      # 数据库文件持久化到宿主机 ./data，首次启动自动建表
+      - charter-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/overview').then(r=>{if(r.status!==200)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 8s
+
+volumes:
+  charter-data:

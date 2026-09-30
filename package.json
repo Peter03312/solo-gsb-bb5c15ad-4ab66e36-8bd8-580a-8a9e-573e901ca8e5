@@ -1,0 +1,18 @@
+{
+  "name": "club-charter-revision",
+  "version": "1.0.0",
+  "description": "社团章程修订 Web 应用：版本化条款、并行草案合并、悬空引用检测与原子发布",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/model.test.js",
+    "test:e2e": "node test/run-e2e.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

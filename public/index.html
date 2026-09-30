@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>社团章程修订平台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📜</span>
+      <div>
+        <h1 id="charterTitle">社团章程</h1>
+        <span class="subtitle">条款版本管理 · 并行草案合并 · 定时生效排程</span>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-view="drafts">草案</button>
+      <button class="tab" data-view="schedule">生效排程</button>
+      <button class="tab" data-view="history">发布历史</button>
+    </nav>
+  </header>
+
+  <main id="main"></main>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="modalRoot"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
