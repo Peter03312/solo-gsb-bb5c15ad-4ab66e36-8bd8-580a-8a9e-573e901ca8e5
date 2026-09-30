@@ -42,10 +42,11 @@ function run(suite) {
 }
 
 async function main() {
+  let server3 = null;
   try {
     await waitForServer();
     await run('e2e.js');
-    // 两套套件各自要求空库：第二个套件换库重启
+    // 各套套件各自要求空库：换库重启
     server.kill();
     await new Promise((r) => setTimeout(r, 300));
     fs.rmSync(tmpDb, { force: true });
@@ -57,16 +58,28 @@ async function main() {
     });
     await new Promise((r) => setTimeout(r, 600));
     try {
+      await waitForServer();
       await run('preview.e2e.js');
     } finally {
       server2.kill();
     }
+    // 历史/撤销/重做套件：再换空库
+    fs.rmSync(tmpDb, { force: true });
+    for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
+    server3 = spawn(process.execPath, [path.join(root, 'src', 'server.js')], {
+      cwd: root,
+      env: { ...process.env, DB_PATH: tmpDb, PORT: port },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    await waitForServer();
+    await run('history.e2e.js');
     console.log('\n端到端测试全部通过');
   } catch (err) {
     console.error(err.message);
     server.kill();
     process.exit(1);
   } finally {
+    if (server3) server3.kill();
     fs.rmSync(tmpDb, { force: true });
     for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
   }

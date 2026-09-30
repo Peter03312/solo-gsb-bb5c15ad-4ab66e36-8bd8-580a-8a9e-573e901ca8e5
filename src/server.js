@@ -13,9 +13,7 @@ const {
   getDraftMeta,
   insertVersion,
   snapshotDraft,
-  replaceDraftContent,
   loadDraftMoved,
-  saveDraftMoved,
   getScheduleRevision,
   bumpScheduleRevision,
   insertPreviewToken,
@@ -23,6 +21,11 @@ const {
   supersedePreviewTokens,
   markPreviewConsumed,
   prunePreviewTokens,
+  draftSnapshotJson,
+  listDraftOperations,
+  getDraftOperation,
+  restoreDraftSnapshot,
+  appendDraftOperation,
   nowIso,
 } = require('./db');
 const {
@@ -354,8 +357,14 @@ function summarizeDiff(diff) {
 // ---------------------------------------------------------------------------
 // 草案编辑
 // ---------------------------------------------------------------------------
-// fn(state, movedSet) 可直接修改条款状态与显式移动集合
-function mutateDraft(draftId, fn) {
+// fn(state, movedSet) 可直接修改条款状态与显式移动集合；
+// 校验失败返回 { error:true, payload }，不产生操作记录、不推进草案修订号；
+// 成功且内容确有变化时，在同一事务内写入一条持久操作记录（含完整快照），
+// 撤销后再编辑会截断重做分支。
+// opts.kind / opts.summary / opts.detail 描述本次操作；
+// opts.describe(state, movedSet) 可在修改完成后动态生成 { summary, detail }（如移动后的实际位置）。
+// opts.noRecord=true 时只改内容（当前流程未使用，保留给非历史化写入）。
+function mutateDraft(draftId, fn, opts = {}) {
   const meta = getDraftMeta(db, draftId);
   if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
   if (meta.status !== 'open') {
@@ -363,16 +372,130 @@ function mutateDraft(draftId, fn) {
   }
   const state = loadDraftState(db, draftId);
   const movedSet = new Set(meta.moved_keys);
+  const before = draftSnapshotJson(meta.name, state, movedSet);
   const result = fn(state, movedSet);
   if (result && result.error) return { status: result.status || 400, payload: result.payload };
   // 移动记录只保留存活条款
   for (const k of [...movedSet]) if (!state.clauses.has(k)) movedSet.delete(k);
+  const after = draftSnapshotJson(meta.name, state, movedSet);
+  if (after === before) {
+    // 无实际改动：不产生操作记录、不递增修订号
+    return { status: 200, payload: draftDetail(draftId), unchanged: true };
+  }
+  const described = opts.describe ? opts.describe(state, movedSet) || {} : {};
+  const kind = described.kind || opts.kind || 'edit';
+  const summary = described.summary || opts.summary || '编辑草案';
+  const detail = described.detail !== undefined ? described.detail : opts.detail || null;
   const tx = db.transaction(() => {
-    replaceDraftContent(db, draftId, state);
-    saveDraftMoved(db, draftId, movedSet);
+    appendDraftOperation(db, {
+      draftId,
+      kind,
+      summary,
+      detail,
+      name: meta.name,
+      state,
+      movedSet,
+    });
   });
   tx();
   return { status: 200, payload: draftDetail(draftId) };
+}
+
+// ---------------------------------------------------------------------------
+// 操作历史 / 撤销 / 重做
+// 每个草案维护一条持久操作链（序号从 1 开始），每条记录带操作完成后的完整快照。
+// 撤销/重做只移动 history_pos 游标并按快照恢复：条款顺序、标题正文、引用、显式
+// 移动记录与草案名称一次性还原；游标移动本身不新增操作记录。
+// 撤销/重做必须携带读取时的草案修订号（revision，乐观锁）；过期则拒绝覆盖并
+// 在响应中返回当前草案与历史，由调用方刷新后重试。
+// ---------------------------------------------------------------------------
+function draftHistoryPayload(draftId) {
+  const meta = getDraftMeta(db, draftId);
+  if (!meta) return null;
+  const operations = listDraftOperations(db, draftId);
+  return {
+    draft_id: draftId,
+    revision: meta.revision,
+    history_pos: meta.history_pos,
+    can_undo: meta.history_pos > 1,
+    can_redo: meta.history_pos < operations.length,
+    operations, // 按序号升序；history_pos 即“当前位置对应的操作序号”
+  };
+}
+
+function handleDraftHistory(draftId) {
+  const payload = draftHistoryPayload(draftId);
+  return payload ? { status: 200, payload } : { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+}
+
+function handleUndoRedo(draftId, body, direction) {
+  const revRaw = body.revision;
+  if (revRaw === undefined || revRaw === null || !Number.isInteger(revRaw)) {
+    return {
+      status: 400,
+      payload: { error: 'VALIDATION', message: '请携带读取草案时获得的 revision（整数草案修订号）' },
+    };
+  }
+
+  return runImmediate(() => {
+    const meta = getDraftMeta(db, draftId);
+    if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+    if (meta.status !== 'open') {
+      return { status: 409, payload: { error: 'CLOSED', message: '草案已发布，不能再撤销或重做' } };
+    }
+    // 乐观并发：修订号过期则拒绝覆盖，返回当前草案与历史
+    if (revRaw !== meta.revision) {
+      return {
+        status: 409,
+        payload: {
+          error: 'STALE_DRAFT_REVISION',
+          message: `草案修订号已过期（携带 ${revRaw}，当前 ${meta.revision}），${direction === 'undo' ? '撤销' : '重做'}未执行；请以返回的当前草案为准后重试。`,
+          draft: draftDetail(draftId),
+          history: draftHistoryPayload(draftId),
+        },
+      };
+    }
+
+    const operations = listDraftOperations(db, draftId);
+    const targetSeq = direction === 'undo' ? meta.history_pos - 1 : meta.history_pos + 1;
+    if (direction === 'undo' && meta.history_pos <= 1) {
+      return {
+        status: 409,
+        payload: { error: 'NOTHING_TO_UNDO', message: '已到最早状态，没有可撤销的操作', draft: draftDetail(draftId), history: draftHistoryPayload(draftId) },
+      };
+    }
+    if (direction === 'redo' && meta.history_pos >= operations.length) {
+      return {
+        status: 409,
+        payload: { error: 'NOTHING_TO_REDO', message: '没有可重做的操作（撤销后若已产生新编辑，重做分支已被舍弃）', draft: draftDetail(draftId), history: draftHistoryPayload(draftId) },
+      };
+    }
+    const snapshotOp = getDraftOperation(db, draftId, targetSeq);
+    if (!snapshotOp) {
+      return { status: 404, payload: { error: 'NOT_FOUND', message: '目标操作记录不存在' } };
+    }
+    // 撤销：被撤销的是旧游标位置上的操作（seq=history_pos）；重做：被重做的是目标位置操作。
+    const appliedOp =
+      direction === 'undo' ? getDraftOperation(db, draftId, meta.history_pos) : snapshotOp;
+
+    // 按快照整体恢复：名称、顺序、标题正文、引用、显式移动记录一次还原。
+    // 恢复前取得的预览凭据必须失效。
+    supersedePreviewTokens(db, draftId);
+    restoreDraftSnapshot(db, draftId, targetSeq, snapshotOp.snapshot);
+
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        action: direction,
+        applied_seq: appliedOp.seq,
+        applied_kind: appliedOp.kind,
+        applied_summary: appliedOp.summary,
+        draft: draftDetail(draftId),
+        history: draftHistoryPayload(draftId),
+      },
+    };
+  });
 }
 
 function draftRoutes(method, url, body, query) {
@@ -389,15 +512,34 @@ function draftRoutes(method, url, body, query) {
   if (method === 'PATCH' && sub === '') {
     const meta = getDraftMeta(db, draftId);
     if (!meta) return { status: 404, payload: { error: 'NOT_FOUND' } };
+    if (meta.status !== 'open') {
+      return { status: 409, payload: { error: 'CLOSED', message: '草案已发布，不能再重命名' } };
+    }
     const name = String(body.name || '').trim();
     if (!name) return { status: 400, payload: { error: 'VALIDATION', message: '草案名称不能为空' } };
-    db.prepare('UPDATE drafts SET name = ?, updated_at = ? WHERE id = ?').run(
-      name,
-      new Date().toISOString(),
-      draftId,
-    );
+    if (name === meta.name) {
+      return { status: 200, payload: draftDetail(draftId), unchanged: true };
+    }
+    const state = loadDraftState(db, draftId);
+    const movedSet = new Set(meta.moved_keys);
+    const tx = db.transaction(() => {
+      appendDraftOperation(db, {
+        draftId,
+        kind: 'rename',
+        summary: `草案改名：「${meta.name}」→「${name}」`,
+        detail: { from: meta.name, to: name },
+        name,
+        state,
+        movedSet,
+      });
+    });
+    tx();
     return { status: 200, payload: draftDetail(draftId) };
   }
+
+  if (method === 'GET' && sub === '/history') return handleDraftHistory(draftId);
+  if (method === 'POST' && sub === '/undo') return handleUndoRedo(draftId, body, 'undo');
+  if (method === 'POST' && sub === '/redo') return handleUndoRedo(draftId, body, 'redo');
 
   if (method === 'POST' && sub === '/publish') {
     // 携带预览凭据 -> 凭据确认发布；否则沿用原有直接发布
@@ -419,16 +561,24 @@ function clauseRoutes(method, sub, body, draftId) {
     const key = String(body.key || '').trim();
     const title = String(body.title || '').trim();
     const text = String(body.body ?? '');
-    return mutateDraft(draftId, (state) => {
-      const kerr = keyError(key);
-      if (kerr) return { error: true, payload: { error: 'VALIDATION', message: kerr } };
-      if (state.clauses.has(key))
-        return { error: true, payload: { error: 'DUP_KEY', message: `条款标识「${key}」已存在` } };
-      if (!title) return { error: true, payload: { error: 'VALIDATION', message: '标题不能为空' } };
-      if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
-      state.order.push(key);
-      state.clauses.set(key, { key, title, body: text });
-    });
+    return mutateDraft(
+      draftId,
+      (state) => {
+        const kerr = keyError(key);
+        if (kerr) return { error: true, payload: { error: 'VALIDATION', message: kerr } };
+        if (state.clauses.has(key))
+          return { error: true, payload: { error: 'DUP_KEY', message: `条款标识「${key}」已存在` } };
+        if (!title) return { error: true, payload: { error: 'VALIDATION', message: '标题不能为空' } };
+        if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
+        state.order.push(key);
+        state.clauses.set(key, { key, title, body: text });
+      },
+      {
+        kind: 'clause-add',
+        summary: `新增条款「${key}」（${title}）`,
+        detail: { key, title },
+      },
+    );
   }
 
   // 具体条款资源：/clauses/:key 或 /clauses/:key/move
@@ -437,47 +587,68 @@ function clauseRoutes(method, sub, body, draftId) {
   const key = decodeURIComponent(m[1]);
 
   if (m[2] === '/move' && method === 'POST') {
-    return mutateDraft(draftId, (state, movedSet) => {
-      if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
-      const oldOrder = [...state.order];
-      const idx = state.order.indexOf(key);
-      state.order.splice(idx, 1);
-      if (typeof body.ordinal === 'number') {
-        const target = Math.max(0, Math.min(body.ordinal, state.order.length));
-        state.order.splice(target, 0, key);
-      } else {
-        const after = body.after === undefined ? null : String(body.after);
-        if (after === null || after === '') {
-          state.order.unshift(key);
+    return mutateDraft(
+      draftId,
+      (state, movedSet) => {
+        if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
+        const oldOrder = [...state.order];
+        const idx = state.order.indexOf(key);
+        state.order.splice(idx, 1);
+        if (typeof body.ordinal === 'number') {
+          const target = Math.max(0, Math.min(body.ordinal, state.order.length));
+          state.order.splice(target, 0, key);
         } else {
-          const at = state.order.indexOf(after);
-          if (at === -1) return { error: true, payload: { error: 'BAD_ANCHOR', message: '锚点条款不存在' } };
-          state.order.splice(at + 1, 0, key);
+          const after = body.after === undefined ? null : String(body.after);
+          if (after === null || after === '') {
+            state.order.unshift(key);
+          } else {
+            const at = state.order.indexOf(after);
+            if (at === -1) return { error: true, payload: { error: 'BAD_ANCHOR', message: '锚点条款不存在' } };
+            state.order.splice(at + 1, 0, key);
+          }
         }
-      }
-      // 只有顺序真的发生变化才记录显式移动
-      if (state.order.some((k, i) => oldOrder[i] !== k)) movedSet.add(key);
-    });
+        // 只有顺序真的发生变化才记录显式移动
+        if (state.order.some((k, i) => oldOrder[i] !== k)) movedSet.add(key);
+      },
+      {
+        kind: 'clause-move',
+        describe: (state) => {
+          const pos = state.order.indexOf(key);
+          return { summary: `移动条款「${key}」至第 ${pos + 1} 位`, detail: { key, ordinal: pos } };
+        },
+      },
+    );
   }
 
   if (method === 'PUT') {
     const title = String(body.title || '').trim();
     const text = String(body.body ?? '');
-    return mutateDraft(draftId, (state) => {
-      if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
-      if (!title) return { error: true, payload: { error: 'VALIDATION', message: '标题不能为空' } };
-      if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
-      state.clauses.set(key, { key, title, body: text });
-    });
+    return mutateDraft(
+      draftId,
+      (state) => {
+        if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
+        if (!title) return { error: true, payload: { error: 'VALIDATION', message: '标题不能为空' } };
+        if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
+        state.clauses.set(key, { key, title, body: text });
+      },
+      {
+        kind: 'clause-edit',
+        describe: () => ({ summary: `改写条款「${key}」（${title}）`, detail: { key, title } }),
+      },
+    );
   }
 
   if (method === 'DELETE') {
-    return mutateDraft(draftId, (state) => {
-      if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
-      state.order.splice(state.order.indexOf(key), 1);
-      // 删除条款：其出边保留在草案中并成为悬空引用（可暂存、阻止发布、可重新建回同标识条款消除）
-      state.clauses.delete(key);
-    });
+    return mutateDraft(
+      draftId,
+      (state) => {
+        if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
+        state.order.splice(state.order.indexOf(key), 1);
+        // 删除条款：其出边保留在草案中并成为悬空引用（可暂存、阻止发布、可重新建回同标识条款消除）
+        state.clauses.delete(key);
+      },
+      { kind: 'clause-delete', summary: `删除条款「${key}」`, detail: { key } },
+    );
   }
 
   return { status: 405, payload: { error: 'METHOD_NOT_ALLOWED' } };
@@ -488,25 +659,47 @@ function refRoutes(method, sub, body, draftId) {
     const source = String(body.source || '').trim();
     const target = String(body.target || '').trim();
     const label = String(body.label || '').trim();
-    return mutateDraft(draftId, (state) => {
-      const skerr = keyError(source);
-      if (skerr) return { error: true, payload: { error: 'VALIDATION', message: `来源标识无效：${skerr}` } };
-      const tkerr = keyError(target);
-      if (tkerr) return { error: true, payload: { error: 'VALIDATION', message: `目标标识无效：${tkerr}` } };
-      const dup = state.edges.some((e) => e.source === source && e.target === target && (e.label || '') === label);
-      if (dup) return { error: true, payload: { error: 'DUP_REF', message: '相同引用已存在' } };
-      // 允许暂存指向尚不存在条款的引用
-      state.edges.push({ source, target, label });
-    });
+    return mutateDraft(
+      draftId,
+      (state) => {
+        const skerr = keyError(source);
+        if (skerr) return { error: true, payload: { error: 'VALIDATION', message: `来源标识无效：${skerr}` } };
+        const tkerr = keyError(target);
+        if (tkerr) return { error: true, payload: { error: 'VALIDATION', message: `目标标识无效：${tkerr}` } };
+        const dup = state.edges.some((e) => e.source === source && e.target === target && (e.label || '') === label);
+        if (dup) return { error: true, payload: { error: 'DUP_REF', message: '相同引用已存在' } };
+        // 允许暂存指向尚不存在条款的引用
+        state.edges.push({ source, target, label });
+      },
+      {
+        kind: 'ref-add',
+        summary: `新增引用 ${source} → ${target}${label ? `（${label}）` : ''}`,
+        detail: { source, target, label },
+      },
+    );
   }
   const m = sub.match(/^\/refs\/(\d+)$/);
   if (m && method === 'DELETE') {
     const refOrdinal = parseInt(m[1], 10);
-    return mutateDraft(draftId, (state) => {
-      if (refOrdinal < 0 || refOrdinal >= state.edges.length)
-        return { error: true, payload: { error: 'NOT_FOUND', message: '引用不存在' } };
-      state.edges.splice(refOrdinal, 1);
-    });
+    let removed = null;
+    return mutateDraft(
+      draftId,
+      (state) => {
+        if (refOrdinal < 0 || refOrdinal >= state.edges.length)
+          return { error: true, payload: { error: 'NOT_FOUND', message: '引用不存在' } };
+        removed = state.edges[refOrdinal];
+        state.edges.splice(refOrdinal, 1);
+      },
+      {
+        kind: 'ref-delete',
+        describe: () => ({
+          summary: removed
+            ? `删除引用 ${removed.source} → ${removed.target}${removed.label ? `（${removed.label}）` : ''}`
+            : '删除引用',
+          detail: removed ? { source: removed.source, target: removed.target, label: removed.label || '' } : {},
+        }),
+      },
+    );
   }
   return { status: 404, payload: { error: 'NOT_FOUND' } };
 }

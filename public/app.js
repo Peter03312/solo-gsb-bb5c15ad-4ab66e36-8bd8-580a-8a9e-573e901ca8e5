@@ -6,6 +6,7 @@ const state = {
   overview: null,
   draftId: null,
   draft: null,
+  draftHistory: null,
   versionId: null,
   version: null,
   schedule: null,
@@ -392,12 +393,34 @@ function stat(num, lbl) {
 // 草案编辑
 // ---------------------------------------------------------------------------
 async function openDraft(id) {
-  state.draft = await api('GET', `/api/drafts/${id}?diff=1`);
+  const [draft, history] = await Promise.all([
+    api('GET', `/api/drafts/${id}?diff=1`),
+    api('GET', `/api/drafts/${id}/history`),
+  ]);
+  state.draft = draft;
+  state.draftHistory = history;
+}
+
+// 以接口返回的最新草案/历史同步本地状态（用于撤销、重做及修订号过期响应）。
+function syncDraft(draft, history) {
+  if (draft) state.draft = draft;
+  if (history) state.draftHistory = history;
+}
+
+// 编辑类接口成功后：以返回结果确认成功，再取带正文差异的完整草案详情与最新历史并整体刷新。
+async function afterDraftEdit() {
+  const id = state.draftId;
+  const [draft, h] = await Promise.all([
+    api('GET', `/api/drafts/${id}?diff=1`),
+    api('GET', `/api/drafts/${id}/history`),
+  ]);
+  syncDraft(draft, h);
+  await refresh();
 }
 
 function renderDraft() {
   const wrap = el('div', {});
-  if (!state.draft || state.draft.id !== state.draftId) {
+  if (!state.draft || state.draft.id !== state.draftId || !state.draftHistory || state.draftHistory.draft_id !== state.draftId) {
     openDraft(state.draftId).then(render).catch((e) => toast(e.message, 'err'));
     return wrap;
   }
@@ -423,7 +446,7 @@ function renderDraft() {
       el('button', {
         class: 'btn secondary small',
         onclick: async () => {
-          try { await api('PATCH', `/api/drafts/${d.id}`, { name: nameInput.value }); await refresh(); }
+          try { const dd = await api('PATCH', `/api/drafts/${d.id}`, { name: nameInput.value }); await afterDraftEdit(dd); toast('草案名称已保存，可在操作历史中撤销', 'ok'); }
           catch (e) { toast(e.message, 'err'); }
         },
       }, '保存名称'),
@@ -456,6 +479,9 @@ function renderDraft() {
     );
     wrap.appendChild(ip);
   }
+
+  // 操作历史（持久撤销/重做）
+  wrap.appendChild(renderHistoryPanel(d));
 
   const wrapGrid = el('div', { class: 'grid2' });
 
@@ -496,7 +522,7 @@ function renderDraft() {
         ? el('button', {
             class: 'icon-btn', title: '删除引用',
             onclick: async () => {
-              try { await api('DELETE', `/api/drafts/${d.id}/refs/${r.ordinal}`); await refresh(); toast('引用已删除', 'ok'); }
+              try { const d = await api('DELETE', `/api/drafts/${d.id}/refs/${r.ordinal}`); await afterDraftEdit(d); toast('引用已删除，可在操作历史中撤销', 'ok'); }
               catch (e) { toast(e.message, 'err'); }
             },
           }, '✕')
@@ -506,6 +532,94 @@ function renderDraft() {
   wrapGrid.appendChild(rp);
   wrap.appendChild(wrapGrid);
   return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// 操作历史：查看与逐步撤销/重做
+// ---------------------------------------------------------------------------
+const OP_KIND_LABEL = {
+  create: '创建',
+  'clause-add': '新增条款',
+  'clause-edit': '改写',
+  'clause-delete': '删除条款',
+  'clause-move': '移动',
+  'ref-add': '新增引用',
+  'ref-delete': '删除引用',
+  rename: '改名',
+};
+
+function renderHistoryPanel(d) {
+  const h = state.draftHistory;
+  const panel = el('div', { class: 'panel' });
+  const hd = el('div', { class: 'panel-hd' },
+    el('h2', {}, `操作历史（${h.operations.length}）`),
+    el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
+      el('span', { class: 'muted small' },
+        `草案修订号 #${h.revision} · 当前位于第 ${h.history_pos}/${h.operations.length} 步`),
+      el('button', {
+        class: 'btn secondary small', disabled: !h.can_undo || d.status !== 'open',
+        title: '撤销上一步（携带当前草案修订号）',
+        onclick: () => stepHistory(d.id, 'undo'),
+      }, '↩ 撤销'),
+      el('button', {
+        class: 'btn secondary small', disabled: !h.can_redo || d.status !== 'open',
+        title: '重做下一步',
+        onclick: () => stepHistory(d.id, 'redo'),
+      }, '↪ 重做'),
+    ),
+  );
+  panel.appendChild(hd);
+  const bd = el('div', { class: 'panel-bd' });
+  panel.appendChild(bd);
+  bd.appendChild(el('p', { class: 'muted small' },
+    '条款新增、改写、删除、移动，引用增删与草案改名都会形成持久记录；恢复会同时还原条款顺序、标题正文、引用与显式移动记录。撤销后再编辑将舍弃重做分支；已发布草案仅可查看历史。'));
+
+  const rows = [...h.operations].reverse(); // 最新在上
+  const list = el('div', { class: 'history-list' });
+  for (const op of rows) {
+    const isCurrent = op.seq === h.history_pos;
+    const inFuture = op.seq > h.history_pos; // 已撤销、可重做
+    list.appendChild(el('div', { class: `history-row ${isCurrent ? 'current' : ''} ${inFuture ? 'future' : ''}` },
+      el('span', { class: 'history-seq' }, `#${op.seq}`),
+      el('span', { class: `badge ${historyKindClass(op.kind)}` }, OP_KIND_LABEL[op.kind] || op.kind),
+      el('span', { class: 'history-summary' }, op.summary),
+      el('span', { class: 'muted small' }, fmtTime(op.created_at)),
+      isCurrent ? el('span', { class: 'badge open' }, '当前') : inFuture ? el('span', { class: 'muted small' }, '已撤销') : null,
+    ));
+  }
+  bd.appendChild(list);
+  return panel;
+}
+
+function historyKindClass(kind) {
+  if (kind === 'create') return 'open';
+  if (kind === 'clause-add' || kind === 'ref-add') return 'ok';
+  if (kind === 'clause-delete' || kind === 'ref-delete') return 'err';
+  if (kind === 'clause-move') return 'neutral';
+  return 'warn';
+}
+
+async function stepHistory(draftId, direction) {
+  const h0 = state.draftHistory;
+  if (h0 == null) return;
+  const verb = direction === 'undo' ? '撤销' : '重做';
+  try {
+    const r = await api('POST', `/api/drafts/${draftId}/${direction}`, { revision: h0.revision });
+    syncDraft(r.draft, r.history);
+    // 重新取带正文差异的完整详情，保证差异弹窗仍可打开
+    state.draft = await api('GET', `/api/drafts/${draftId}?diff=1`);
+    await refresh();
+    toast(`已${verb}：${r.applied_summary}`, 'ok');
+  } catch (e) {
+    const p = e.payload || {};
+    if (p.error === 'STALE_DRAFT_REVISION') {
+      syncDraft(p.draft, p.history);
+      await refresh();
+      toast(`草案已被其他操作修改，修订号过期；已刷新为当前状态，请重新${verb}`, 'err');
+    } else {
+      toast(e.message, 'err');
+    }
+  }
 }
 
 function renderDiffSummary(d) {
@@ -569,17 +683,17 @@ function renderDraftClause(d, c, i) {
 
 async function moveClause(draftId, key, newOrdinal) {
   try {
-    await api('POST', `/api/drafts/${draftId}/clauses/${encodeURIComponent(key)}/move`, { ordinal: newOrdinal });
-    await refresh();
+    const d = await api('POST', `/api/drafts/${draftId}/clauses/${encodeURIComponent(key)}/move`, { ordinal: newOrdinal });
+    await afterDraftEdit(d);
   } catch (e) { toast(e.message, 'err'); }
 }
 
 async function deleteClause(draftId, c) {
-  if (!confirm(`删除条款「${c.key} ${c.title}」？\n其相关引用会保留为悬空引用（草案仍可暂存，但不能发布，直到删除悬空引用或重建同标识条款）。`)) return;
+  if (!confirm(`删除条款「${c.key} ${c.title}」？\n其相关引用会保留为悬空引用（草案仍可暂存，但不能发布，直到删除悬空引用或重建同标识条款）。\n该操作可在“操作历史”中撤销。`)) return;
   try {
-    await api('DELETE', `/api/drafts/${draftId}/clauses/${encodeURIComponent(c.key)}`);
-    await refresh();
-    toast('条款已删除；引用暂存为悬空状态', 'ok');
+    const d = await api('DELETE', `/api/drafts/${draftId}/clauses/${encodeURIComponent(c.key)}`);
+    await afterDraftEdit(d);
+    toast('条款已删除；引用暂存为悬空状态，可在操作历史中撤销', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -606,10 +720,10 @@ function openAddClause(draftId) {
         class: 'btn', onclick: async () => {
           err.innerHTML = '';
           try {
-            await api('POST', `/api/drafts/${draftId}/clauses`, {
+            const d = await api('POST', `/api/drafts/${draftId}/clauses`, {
               key: key.value, title: ttl.value, body: body.value,
             });
-            closeModal(); await refresh(); toast('条款已新增', 'ok');
+            closeModal(); await afterDraftEdit(d); toast('条款已新增，可在操作历史中撤销', 'ok');
           } catch (e) { err.appendChild(renderIssueList([{ message: e.message }])); }
         },
       }, '添加'),
@@ -633,10 +747,10 @@ function openEditClause(draftId, c) {
       el('button', {
         class: 'btn', onclick: async () => {
           try {
-            await api('PUT', `/api/drafts/${draftId}/clauses/${encodeURIComponent(c.key)}`, {
+            const d = await api('PUT', `/api/drafts/${draftId}/clauses/${encodeURIComponent(c.key)}`, {
               title: ttl.value, body: body.value,
             });
-            closeModal(); await refresh(); toast('条款已保存', 'ok');
+            closeModal(); await afterDraftEdit(d); toast('条款已保存，可在操作历史中撤销', 'ok');
           } catch (e) { err.innerHTML = ''; err.appendChild(renderIssueList([{ message: e.message }])); }
         },
       }, '保存'),
@@ -667,8 +781,8 @@ function openAddRef(draftId) {
       el('button', {
         class: 'btn', onclick: async () => {
           try {
-            await api('POST', `/api/drafts/${draftId}/refs`, { source: src.value, target: tgt.value, label: lbl.value });
-            closeModal(); await refresh(); toast('引用已暂存', 'ok');
+            const d = await api('POST', `/api/drafts/${draftId}/refs`, { source: src.value, target: tgt.value, label: lbl.value });
+            closeModal(); await afterDraftEdit(d); toast('引用已暂存，可在操作历史中撤销', 'ok');
           } catch (e) { err.innerHTML = ''; err.appendChild(renderIssueList([{ message: e.message }])); }
         },
       }, '添加引用'),

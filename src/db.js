@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS version_refs (
 );
 
 -- 草案
+-- revision：草案修订号（乐观锁）。任一次被记录的编辑、重命名、撤销、重做都使其递增；
+--           校验失败/无实际改动的请求不递增。撤销/重做必须携带读取时的修订号。
+-- history_pos：当前状态对应的历史操作序号（1 = 创建操作后的状态）；新编辑会截断其后的重做分支。
 CREATE TABLE IF NOT EXISTS drafts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -53,8 +56,24 @@ CREATE TABLE IF NOT EXISTS drafts (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',       -- open | published
-  moved_keys TEXT NOT NULL DEFAULT '[]'      -- 草案中被显式移动过的条款标识
+  moved_keys TEXT NOT NULL DEFAULT '[]',     -- 草案中被显式移动过的条款标识
+  revision INTEGER NOT NULL DEFAULT 1,
+  history_pos INTEGER NOT NULL DEFAULT 0
 );
+
+-- 草案操作历史（持久、可追溯；撤销/重做只移动游标，不删除记录；新编辑截断重做分支）
+CREATE TABLE IF NOT EXISTS draft_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id INTEGER NOT NULL REFERENCES drafts(id),
+  seq INTEGER NOT NULL,                        -- 草案内操作序号，从 1 开始
+  kind TEXT NOT NULL,                          -- create | clause-add | clause-edit | clause-delete | clause-move | ref-add | ref-delete | rename
+  summary TEXT NOT NULL,                       -- 人类可读摘要
+  detail TEXT,                                 -- 结构化细节（JSON，可为 NULL）
+  snapshot TEXT NOT NULL,                      -- 该操作完成后的完整快照（名称/顺序/条款/引用/显式移动记录）
+  created_at TEXT NOT NULL,
+  UNIQUE (draft_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_ops ON draft_operations(draft_id);
 
 CREATE TABLE IF NOT EXISTS draft_clauses (
   draft_id INTEGER NOT NULL REFERENCES drafts(id),
@@ -124,6 +143,31 @@ function migrate(db) {
   addColumnIfMissing('versions', 'effective_at', 'effective_at TEXT');
   addColumnIfMissing('versions', 'schedule_status', "schedule_status TEXT NOT NULL DEFAULT 'immediate'");
   addColumnIfMissing('meta', 'schedule_revision', 'schedule_revision INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing('drafts', 'revision', 'revision INTEGER NOT NULL DEFAULT 1');
+  addColumnIfMissing('drafts', 'history_pos', 'history_pos INTEGER NOT NULL DEFAULT 0');
+  // 早期草案回填操作历史：每个草案补一条“创建草案”快照（旧草案即从该状态起可撤销/重做）。
+  const orphanDrafts = db
+    .prepare(
+      `SELECT d.id AS id, d.name AS name FROM drafts d
+       LEFT JOIN draft_operations o ON o.draft_id = d.id
+       WHERE o.id IS NULL`,
+    )
+    .all();
+  for (const d of orphanDrafts) {
+    const st = loadDraftState(db, d.id);
+    const moved = loadDraftMoved(db, d.id);
+    const row = db.prepare('SELECT created_at FROM drafts WHERE id = ?').get(d.id);
+    insertDraftOperation(db, {
+      draftId: d.id,
+      seq: 1,
+      kind: 'create',
+      summary: `创建草案「${d.name}」`,
+      detail: null,
+      snapshot: draftSnapshotJson(d.name, st, moved),
+      createdAt: row.created_at,
+    });
+    db.prepare('UPDATE drafts SET history_pos = 1 WHERE id = ?').run(d.id);
+  }
   // 早期库回填（仅当存在没有生效时刻的旧版本行时执行一次）：
   // 已存在版本按创建时刻即时生效。
   const legacy = db.prepare('SELECT COUNT(*) AS n FROM versions WHERE effective_at IS NULL OR effective_at = ?').get('');
@@ -199,7 +243,9 @@ function listDrafts(db) {
 
 function getDraftMeta(db, draftId) {
   const row = db
-    .prepare('SELECT id, name, baseline_id, created_at, updated_at, status, moved_keys FROM drafts WHERE id = ?')
+    .prepare(
+      'SELECT id, name, baseline_id, created_at, updated_at, status, moved_keys, revision, history_pos FROM drafts WHERE id = ?',
+    )
     .get(draftId);
   if (row) row.moved_keys = JSON.parse(row.moved_keys || '[]');
   return row;
@@ -216,6 +262,104 @@ function saveDraftMoved(db, draftId, movedSet) {
     nowIso(),
     draftId,
   );
+}
+
+// ---------------------------------------------------------------------------
+// 草案操作历史（调用方负责事务）
+// ---------------------------------------------------------------------------
+// 操作完成后的完整快照：恢复时一次性还原名称、条款顺序、标题正文、引用与显式移动记录。
+function draftSnapshotJson(name, state, movedSet) {
+  return JSON.stringify({
+    name,
+    moved: [...movedSet],
+    order: state.order,
+    clauses: state.order.map((k) => {
+      const c = state.clauses.get(k);
+      return { key: c.key, title: c.title, body: c.body };
+    }),
+    edges: state.edges.map((e) => ({ source: e.source, target: e.target, label: e.label || '' })),
+  });
+}
+
+function parseDraftSnapshot(json) {
+  const s = JSON.parse(json);
+  return {
+    name: s.name,
+    movedSet: new Set(s.moved || []),
+    state: buildState({
+      order: s.order,
+      clauses: s.clauses,
+      edges: s.edges || [],
+    }),
+  };
+}
+
+function insertDraftOperation(db, { draftId, seq, kind, summary, detail, snapshot, createdAt }) {
+  const ts = createdAt || nowIso();
+  db.prepare(
+    `INSERT INTO draft_operations (draft_id, seq, kind, summary, detail, snapshot, created_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).run(draftId, seq, kind, summary, detail ? JSON.stringify(detail) : null, snapshot, ts);
+  return ts;
+}
+
+function listDraftOperations(db, draftId) {
+  const rows = db
+    .prepare('SELECT id, seq, kind, summary, detail, created_at FROM draft_operations WHERE draft_id = ? ORDER BY seq')
+    .all(draftId);
+  for (const r of rows) r.detail = r.detail ? JSON.parse(r.detail) : null;
+  return rows;
+}
+
+function getDraftOperation(db, draftId, seq) {
+  const row = db
+    .prepare('SELECT id, seq, kind, summary, detail, snapshot, created_at FROM draft_operations WHERE draft_id = ? AND seq = ?')
+    .get(draftId, seq);
+  if (row) row.detail = row.detail ? JSON.parse(row.detail) : null;
+  return row || null;
+}
+
+function maxDraftOperationSeq(db, draftId) {
+  const row = db.prepare('SELECT MAX(seq) AS s FROM draft_operations WHERE draft_id = ?').get(draftId);
+  return row.s || 0;
+}
+
+// 丢弃重做分支：删除序号大于 pos 的全部操作记录。
+function truncateDraftOperationsAfter(db, draftId, pos) {
+  db.prepare('DELETE FROM draft_operations WHERE draft_id = ? AND seq > ?').run(draftId, pos);
+}
+
+// 按历史快照整体恢复草案（名称/顺序/条款正文/引用/显式移动记录），并推进游标与修订号。
+function restoreDraftSnapshot(db, draftId, seq, snapshot) {
+  const parsed = parseDraftSnapshot(snapshot);
+  replaceDraftContent(db, draftId, parsed.state);
+  const ts = nowIso();
+  db.prepare(
+    `UPDATE drafts
+       SET name = ?, moved_keys = ?, history_pos = ?, revision = revision + 1, updated_at = ?
+     WHERE id = ?`,
+  ).run(parsed.name, JSON.stringify([...parsed.movedSet]), seq, ts, draftId);
+  return parsed;
+}
+
+// 追加一次新编辑后的状态：写操作记录、截断重做分支、推进游标与修订号。
+function appendDraftOperation(db, { draftId, kind, summary, detail, name, state, movedSet }) {
+  const maxSeq = maxDraftOperationSeq(db, draftId);
+  const posRow = db.prepare('SELECT history_pos AS p FROM drafts WHERE id = ?').get(draftId);
+  const pos = posRow.p;
+  // 撤销后再编辑：舍弃重做分支
+  if (maxSeq > pos) truncateDraftOperationsAfter(db, draftId, pos);
+  const seq = pos + 1;
+  const snapshot = draftSnapshotJson(name, state, movedSet);
+  const ts = insertDraftOperation(db, { draftId, seq, kind, summary, detail, snapshot });
+  // 持久化当前内容（条款/引用表），再推进游标与修订号
+  replaceDraftContent(db, draftId, state);
+  db.prepare(
+    `UPDATE drafts
+       SET name = ?, moved_keys = ?, history_pos = ?, revision = revision + 1, updated_at = ?
+     WHERE id = ?`,
+  ).run(name, JSON.stringify([...movedSet]), seq, ts, draftId);
+  return { seq, ts, snapshot };
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +411,22 @@ function snapshotDraft(db, draftIdUnused, baselineId, name, state, { from, moved
   const ts = nowIso();
   const info = db
     .prepare(
-      'INSERT INTO drafts (name, baseline_id, created_from, created_at, updated_at, moved_keys) VALUES (?,?,?,?,?,?)',
+      'INSERT INTO drafts (name, baseline_id, created_from, created_at, updated_at, moved_keys, revision, history_pos) VALUES (?,?,?,?,?,?,1,0)',
     )
     .run(name, baselineId, from || 'draft', ts, ts, JSON.stringify([...movedKeys]));
   const id = info.lastInsertRowid;
   replaceDraftContent(db, id, state);
+  const movedSet = new Set(movedKeys);
+  insertDraftOperation(db, {
+    draftId: id,
+    seq: 1,
+    kind: 'create',
+    summary: `创建草案「${name}」`,
+    detail: { baseline_id: baselineId },
+    snapshot: draftSnapshotJson(name, state, movedSet),
+    createdAt: ts,
+  });
+  db.prepare('UPDATE drafts SET history_pos = 1, updated_at = ? WHERE id = ?').run(ts, id);
   return id;
 }
 
@@ -361,4 +516,13 @@ module.exports = {
   supersedePreviewTokens,
   markPreviewConsumed,
   prunePreviewTokens,
+  draftSnapshotJson,
+  parseDraftSnapshot,
+  insertDraftOperation,
+  listDraftOperations,
+  getDraftOperation,
+  maxDraftOperationSeq,
+  truncateDraftOperationsAfter,
+  restoreDraftSnapshot,
+  appendDraftOperation,
 };

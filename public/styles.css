@@ -299,3 +299,15 @@ del { background: #f7c9c2; text-decoration: line-through; border-radius: 3px; }
 .empty .big { font-size: 40px; margin-bottom: 8px; }
 
 .compare-picker { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* 操作历史（撤销/重做） */
+.history-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.history-row {
+  display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 12px; background: #fff;
+}
+.history-row.current { border-color: var(--brand); background: var(--blue-bg); }
+.history-row.future { opacity: 0.55; }
+.history-seq { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12.5px; min-width: 34px; }
+.history-summary { flex: 1; }
