@@ -136,6 +136,10 @@ function closeModal() {
 async function refresh() {
   state.overview = await api('GET', '/api/overview');
   $('#charterTitle').textContent = state.overview.charter_title;
+  // 始终重新加载当前打开的草案：编辑/撤销/重做后条款、引用、修订号与操作历史均需刷新
+  if (state.view === 'drafts' && state.draftId != null) {
+    state.draft = await api('GET', `/api/drafts/${state.draftId}?diff=1`);
+  }
   await render();
 }
 
@@ -439,7 +443,7 @@ function renderDraft() {
     el('div', { style: 'display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:6px' },
       el('span', {}, '名称'), nameInput,
       el('span', { class: 'muted small' },
-        `基线 v${d.baseline_id} · ${d.clauses?.length ?? 0} 条 · 更新 ${fmtTime(d.updated_at)}`),
+        `基线 v${d.baseline_id} · ${d.clauses?.length ?? 0} 条 · 更新 ${fmtTime(d.updated_at)} · 修订号 #${d.revision ?? 0}`),
     ),
     renderDiffSummary(d),
   ));
@@ -458,6 +462,9 @@ function renderDraft() {
   }
 
   const wrapGrid = el('div', { class: 'grid2' });
+
+  // 操作历史 / 撤销重做
+  wrap.appendChild(renderHistoryPanel(d));
 
   // 条款
   const cp = el('div', { class: 'panel' });
@@ -506,6 +513,113 @@ function renderDraft() {
   wrapGrid.appendChild(rp);
   wrap.appendChild(wrapGrid);
   return wrap;
+}
+
+const OP_KIND_LABEL = {
+  'clause-add': ['新增条款', 'ok'],
+  'clause-edit': ['改写条款', 'warn'],
+  'clause-delete': ['删除条款', 'err'],
+  'clause-move': ['移动条款', 'warn'],
+  'ref-add': ['新增引用', 'open'],
+  'ref-delete': ['删除引用', 'neutral'],
+  rename: ['草案改名', 'neutral'],
+};
+
+async function applyHistory(draftId, action, revision) {
+  try {
+    const r = await api('POST', `/api/drafts/${draftId}/${action}`, { revision });
+    toast(action === 'undo' ? `已撤销：${r.operation.summary}` : `已重做：${r.operation.summary}`, 'ok');
+    await refresh();
+  } catch (e) {
+    if (e.payload?.error === 'STALE_DRAFT_REVISION') {
+      // 修订号过期：服务端返回当前草案，本地刷新到最新后提示重试
+      await refresh();
+      toast('草案已被其他操作更新，已加载最新版本，请再试一次', 'err');
+    } else {
+      toast(e.message, 'err');
+    }
+  }
+}
+
+// 逐步撤销/重做到指定操作：循环调用 undo/redo，每步携带最新 revision。
+async function stepToRevision(draftId, targetRevision) {
+  let cur = state.draft.revision;
+  while (cur !== targetRevision) {
+    const action = cur > targetRevision ? 'undo' : 'redo';
+    const r = await api('POST', `/api/drafts/${draftId}/${action}`, { revision: cur });
+    cur = r.revision;
+  }
+  await refresh();
+}
+
+function renderHistoryPanel(d) {
+  const h = d.history || { operations: [], revision: 0, total: 0, can_undo: false, can_redo: false };
+  const panel = el('div', { class: 'panel' });
+  const undoBtn = el('button', {
+    class: 'btn secondary small', disabled: !h.can_undo || d.status !== 'open',
+    onclick: () => applyHistory(d.id, 'undo', h.revision),
+  }, '↶ 撤销一步');
+  const redoBtn = el('button', {
+    class: 'btn secondary small', disabled: !h.can_redo || d.status !== 'open',
+    onclick: () => applyHistory(d.id, 'redo', h.revision),
+  }, '↷ 重做一步');
+  panel.appendChild(el('div', { class: 'panel-hd' },
+    el('div', { style: 'display:flex;align-items:center;gap:10px;flex-wrap:wrap' },
+      el('h2', {}, '操作历史（可追溯的撤销 / 重做）'),
+      el('span', { class: 'muted small' }, `草案修订号 #${h.revision}`),
+    ),
+    el('div', { style: 'display:flex;gap:8px' }, undoBtn, redoBtn),
+  ));
+  const bd = el('div', { class: 'panel-bd' });
+  panel.appendChild(bd);
+  bd.appendChild(el('p', { class: 'muted small', style: 'margin-top:0' },
+    '条款新增、改写、删除、移动，引用增删与草案改名均持久记录；恢复会同时还原条款顺序、标题正文、引用与显式移动记录。撤销后再做新编辑将舍弃重做分支；恢复前取得的预览凭据立即失效。'));
+  if (!h.operations.length) {
+    bd.appendChild(el('div', { class: 'empty small' }, '还没有编辑操作'));
+    return panel;
+  }
+  const tbl = el('table', { class: 'list history-table' },
+    el('thead', {}, el('tr', {},
+      el('th', { style: 'width:44px' }, '#'),
+      el('th', { style: 'width:96px' }, '类型'),
+      el('th', {}, '操作摘要'),
+      el('th', { style: 'width:150px' }, '操作时间'),
+      el('th', { style: 'width:150px' }, '恢复'),
+    )),
+    el('tbody', {},
+      ...[...h.operations].reverse().map((op) => {
+        const [label, cls] = OP_KIND_LABEL[op.kind] || [op.kind, 'neutral'];
+        const atCurrent = op.seq === h.revision;
+        const undone = !op.active;
+        return el('tr', { class: undone ? 'history-undone' : atCurrent ? 'history-current' : '' },
+          el('td', {}, String(op.seq)),
+          el('td', {}, el('span', { class: `badge ${cls}` }, label)),
+          el('td', {},
+            op.summary,
+            atCurrent ? el('span', { class: 'badge open', style: 'margin-left:8px' }, '当前位置') : null,
+            undone ? el('span', { class: 'badge neutral', style: 'margin-left:8px' }, '已撤销') : null,
+          ),
+          el('td', { class: 'muted small' }, fmtTime(op.created_at)),
+          el('td', {}, d.status === 'open'
+            ? el('div', { style: 'display:flex;gap:6px' },
+              el('button', {
+                class: 'btn ghost small', disabled: h.revision < op.seq,
+                title: `逐步撤销到第 ${op.seq} 步之前`,
+                onclick: () => stepToRevision(d.id, op.seq - 1).catch((e) => toast(e.message, 'err')),
+              }, '撤销到此'),
+              el('button', {
+                class: 'btn ghost small', disabled: h.revision >= op.seq,
+                title: `逐步重做到第 ${op.seq} 步`,
+                onclick: () => stepToRevision(d.id, op.seq).catch((e) => toast(e.message, 'err')),
+              }, '重做到此'),
+            )
+            : el('span', { class: 'muted small' }, '草案已发布')),
+        );
+      }),
+    ),
+  );
+  bd.appendChild(tbl);
+  return panel;
 }
 
 function renderDiffSummary(d) {

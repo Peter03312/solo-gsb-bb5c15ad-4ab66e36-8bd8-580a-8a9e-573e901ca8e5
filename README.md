@@ -16,6 +16,7 @@
 - 发布可指定**晚于当前时间的 UTC 生效时刻**：发布后仍**立即生成不可变版本快照**，但到点才自动成为当前生效版（惰性生效，无后台任务）。
 - 页面「生效排程」展示**当前生效版**与**待生效队列**，支持生效前**改期 / 取消**（携带读取时的**排程修订号**乐观并发控制）。
 - 可按任意 UTC 时点查询**当时生效版本**的完整条款、顺序与引用；**已发生时点的结果不随后续改期或取消变化**。
+- 草案编辑具备**可追溯的撤销 / 重做**：条款新增、改写、删除、移动，引用增删与草案改名均形成**持久操作记录**（含操作时间与摘要）；可逐步撤销或重做，恢复时**条款顺序、标题正文、引用及显式移动记录一并还原**；撤销/重做携带读取时的**草案修订号（revision）**做乐观并发控制，撤销后产生新编辑即**舍弃重做分支**；校验失败与空操作**不产生记录**；恢复前取得的预览凭据立即失效；已发布草案不可再操作（历史仍可查看）。
 
 ## 技术栈
 
@@ -90,6 +91,7 @@ Docker Compose 额外支持：
    - 编辑标题/正文（标识不可修改，保证跨版本稳定）；
    - 移动条款顺序、删除条款；
    - 新增/删除引用，允许引用暂不存在的条款——会被标记为**悬空引用**并阻止发布。
+   - 所有编辑都进入「操作历史」面板：展示操作类型、摘要与时间，可逐步 **撤销 / 重做**，或直接跳到某一步（「撤销到此 / 重做到此」）；恢复会完整还原顺序、标题正文、引用与显式移动记录。
 4. **查看差异**：草案页实时显示相对基线的新增/删除/修改/移动与引用增删，可打开“正文差异”查看逐字增删（`<ins>` / `<del>`）。
 5. **预览（可选）与发布**：
    - 点「预览将要发布的版本」可先查看将要落库的最终条款全文/顺序/引用（相对最新发布版的增删改、移动与引用差异），以及立即/定时生效安排；预览**不写版本、不关闭草案**；
@@ -140,7 +142,7 @@ Docker Compose 额外支持：
 | `POST` | `/api/versions/:id/cancel` | 取消待生效排程 `{schedule_revision}` |
 | `GET` | `/api/versions/:id?compare=:otherId` | 查看版本快照（可选两版差异） |
 | `POST` | `/api/drafts` | 从基线版本创建草案 `{baseline_id?, name?}` |
-| `GET` | `/api/drafts/:id?diff=1` | 草案详情、问题清单、基线差异 |
+| `GET` | `/api/drafts/:id?diff=1` | 草案详情、问题清单、基线差异、`revision` 与 `history`（操作历史/可否撤销重做） |
 | `PATCH` | `/api/drafts/:id` | 重命名草案 |
 | `POST` | `/api/drafts/:id/clauses` | 新增条款 |
 | `PUT` | `/api/drafts/:id/clauses/:key` | 编辑条款标题/正文 |
@@ -148,6 +150,9 @@ Docker Compose 额外支持：
 | `POST` | `/api/drafts/:id/clauses/:key/move` | 移动条款 `{ordinal}` 或 `{after}` |
 | `POST` | `/api/drafts/:id/refs` | 新增引用（允许悬空暂存） |
 | `DELETE` | `/api/drafts/:id/refs/:ordinal` | 删除引用 |
+| `GET` | `/api/drafts/:id/history` | 操作历史：记录列表（类型/摘要/细节/时间）、草案修订号、可否撤销/重做 |
+| `POST` | `/api/drafts/:id/undo` | 逐步撤销 `{revision}`（携带读取时的草案修订号） |
+| `POST` | `/api/drafts/:id/redo` | 逐步重做 `{revision}` |
 | `POST` | `/api/drafts/:id/preview` | 发布预览（不写版本/不关草案）：跑完整重放与排程校验，成功返回确认凭据与相对最新版的最终条款/顺序/引用差异 |
 | `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效；携带 `preview_token` 时为**凭据确认发布**（内容须与预览完全一致） |
 
@@ -248,6 +253,63 @@ curl -s -X POST http://localhost:3000/api/drafts/1/publish \
 - 预览在 `BEGIN IMMEDIATE` 事务内读取最新发布版与排程并与并发发布串行化；但预览本身不持有锁到确认时刻，因此上述前提都在**确认事务内**重新核对，即使期间发生并发发布也不会落库与预览不一致的内容。
 - 预览从不产生版本号：确认成功写入的版本号以确认时刻为准。
 
+## 草案操作历史、撤销与重做
+
+条款**新增、改写、删除、移动**，引用**增删**与**草案改名**每一次成功编辑都作为一条不可跳过的操作持久记录（`draft_operations` 表），含操作类型、人类可读摘要、细节与操作时间。草案详情与 `GET /api/drafts/:id/history` 返回：
+
+```json
+{ "revision": 3, "total": 5, "can_undo": true, "can_redo": true,
+  "undo_seq": 3, "redo_seq": 4,
+  "operations": [
+    { "seq": 1, "kind": "rename",      "summary": "草案改名：「旧名」→「新名」", "detail": {"from":"旧名","to":"新名"}, "created_at": "…", "active": true },
+    { "seq": 2, "kind": "clause-add",  "summary": "新增条款「D 新条」", "detail": {"key":"D","ordinal":3}, "created_at": "…", "active": true },
+    { "seq": 3, "kind": "clause-edit", "summary": "改写条款「A 总则」正文", "detail": {"key":"A"}, "created_at": "…", "active": true },
+    { "seq": 4, "kind": "clause-move", "summary": "移动条款「C」：第 3 位 → 第 2 位", "detail": {"key":"C","from":2,"to":1}, "created_at": "…", "active": false },
+    { "seq": 5, "kind": "ref-add",     "summary": "新增引用：A → C（依据）", "detail": {"source":"A","target":"C"}, "created_at": "…", "active": false } ] }
+```
+
+语义规则：
+
+- **修订号即游标**：`revision` 是已应用到草案的操作条数；`seq ≤ revision` 的记录生效中（`active:true`），`seq > revision` 是撤销后保留的**重做分支**。撤销 `revision−1`，重做 `revision+1`。
+- **完整快照恢复**：每条记录保存操作前后的完整草案快照，撤销/重做直接整体重放——**条款顺序、标题正文、引用以及显式移动记录（moved_keys）连同草案名称**一起还原；因此恢复后差异、预览、发布仍完全按现有规则计算（移动语义、三方重放、悬空引用校验不变）。
+- **乐观并发**：撤销/重做必须携带读取草案时获得的 `revision`。过期时整次拒绝：`409 STALE_DRAFT_REVISION`，响应附带**当前草案**（`draft`）与当前历史（`history`）；缺修订号返回 `400 VALIDATION`。
+- **撤销后再编辑**：自动**舍弃重做分支**（删除 `seq > revision` 的记录），新编辑占用下一个 `seq`，此后 `can_redo=false`。
+- **校验失败/空操作不落记录**：标识非法、重复、空标题/空正文、重复引用等 4xx 校验失败不改变草案、不产生记录、`revision` 不变；提交与现状完全一致的改写/改名/移动同样不产生记录（悬空引用允许暂存，删除条款及其引用保留均正常记录）。
+- **预览凭据联动**：撤销/重做属于草案编辑，恢复前取得的预览凭据立即作废（再次确认返回 `404 PREVIEW_TOKEN_NOT_FOUND`），重新预览即可。
+- **已发布草案**：不能撤销/重做/继续编辑（`409 CLOSED`），但 `GET /api/drafts/:id/history` 仍可完整查看其操作记录。
+- 撤销删除条款会连同其出边引用（含当时暂存的悬空引用）一并还原；删除条款本身不会删除引用，符合“引用可暂存为悬空”的既有规则。
+
+### 撤销 / 重做调用示例（curl）
+
+```bash
+# 1) 查看历史（草案详情 GET /api/drafts/:id 也内嵌同一 history 对象）
+curl -s http://localhost:3000/api/drafts/1/history
+# -> { "revision": 3, "can_undo": true, "can_redo": false, "operations": [ … ] }
+
+# 2) 撤销一步：携带读取时的 revision（草案 id=1）
+curl -s -X POST http://localhost:3000/api/drafts/1/undo \
+  -H 'Content-Type: application/json' -d '{"revision":3}'
+# 200 -> { "ok": true, "action": "undo", "seq": 3,
+#          "operation": {"seq":3,"kind":"clause-edit","summary":"…","created_at":"…"},
+#          "revision": 2, "draft": { …当前草案完整详情… },
+#          "history": { "revision":2,"can_undo":true,"can_redo":true, … } }
+
+# 3) 重做一步
+curl -s -X POST http://localhost:3000/api/drafts/1/redo \
+  -H 'Content-Type: application/json' -d '{"revision":2}'
+
+# 4) 修订号过期 -> 409，响应返回当前草案，按其 revision 重试即可
+#    { "error":"STALE_DRAFT_REVISION",
+#      "message":"草案修订号已过期（携带 2，当前 4），操作未执行…",
+#      "draft": { "id":1, "revision":4, "clauses":[…], "refs":[…], … },
+#      "history": { "revision":4, … } }
+
+# 5) 撤销到尽头再撤销 -> 409 NOTHING_TO_UNDO；重做尽头 -> 409 NOTHING_TO_REDO
+#    已发布草案撤销/重做 -> 409 CLOSED；缺少 revision -> 400 VALIDATION
+```
+
+页面上「草案」编辑页的「操作历史」面板以倒序展示每一步的类型徽标、摘要与操作时间，提供顶部「撤销一步 / 重做一步」按钮，以及每行的「撤销到此 / 重做到此」（内部按最新修订号逐步调用 undo/redo）；过期时自动加载服务端返回的当前草案后再试。
+
 ## 目录结构
 
 ```
@@ -257,17 +319,18 @@ curl -s -X POST http://localhost:3000/api/drafts/1/publish \
 ├── package.json
 ├── README.md
 ├── src
-│   ├── server.js      # HTTP 服务、API、原子发布事务、发布预览/凭据确认、生效排程/改期/取消、时点查询
-│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号、预览凭据存取
+│   ├── server.js      # HTTP 服务、API、原子发布事务、发布预览/凭据确认、生效排程/改期/取消、时点查询、操作历史/撤销重做
+│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号、预览凭据、操作记录与快照还原
 │   └── model.js       # 纯逻辑：差异、移动判定、三方重放、悬空引用校验、生效判定/队列
 ├── public
 │   ├── index.html     # 单页应用入口
 │   ├── styles.css
-│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布 / 历史还原 / 生效排程
+│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 操作历史撤销重做 / 发布 / 历史还原 / 生效排程
 └── test
     ├── model.test.js    # 核心合并逻辑与排程判定单元测试（npm test）
     ├── e2e.js           # 端到端 API 冒烟测试（含定时生效/改期/取消/时点查询）
-    └── preview.e2e.js   # 发布预览/凭据确认端到端测试（各类凭据失效场景）
+    ├── preview.e2e.js   # 发布预览/凭据确认端到端测试（各类凭据失效场景）
+    └── history.e2e.js   # 操作历史/撤销/重端端到端测试（记录、快照还原、修订号过期、重做分支舍弃、凭据失效）
 ```
 
 ## 数据持久化与备份
@@ -275,3 +338,4 @@ curl -s -X POST http://localhost:3000/api/drafts/1/publish \
 - 本地运行：数据库即 `DB_PATH` 指向的文件（默认 `./data/charter.db`，WAL 模式另有 `-wal`/`-shm` 伴生文件）。
 - Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本的**条款内容快照**只追加、不更新不删除，具备不可变性。排程仅改 `effective_at` 或置 `schedule_status = cancelled`，不触碰条款快照；升级后首次启动会自动为旧库补齐排程列（旧版本按发布时刻即时生效）。
 - 发布预览凭据保存在 `preview_tokens` 表（首次启动自动建表，无需迁移）：仅记录内容快照哈希所需的规范化 JSON 与生效安排，不是版本数据；重新预览会作废旧凭据，确认成功置为已消费，已消费/超 7 天的记录在下次预览时自动清理。删除该表不影响任何已发布版本。
+- 草案操作记录保存在 `draft_operations` 表（首次启动自动建表，无需迁移），每条含操作前后的完整草案快照（名称、条款顺序、标题正文、引用、显式移动记录）；`drafts.revision` 为草案修订号（旧库首次启动自动补列，既有草案从 `0` 起算）。草案发布后其操作记录仍完整保留供查看；该表仅服务于撤销/重做，不影响已发布版本快照。

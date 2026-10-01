@@ -53,8 +53,26 @@ CREATE TABLE IF NOT EXISTS drafts (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'open',       -- open | published
-  moved_keys TEXT NOT NULL DEFAULT '[]'      -- 草案中被显式移动过的条款标识
+  moved_keys TEXT NOT NULL DEFAULT '[]',     -- 草案中被显式移动过的条款标识
+  revision INTEGER NOT NULL DEFAULT 0        -- 草案修订号（乐观锁）：每次成功编辑 +1，撤销 -1，重做 +1
 );
+
+-- 草案操作历史（可追溯的撤销/重做）：每次成功编辑落一条，携带操作前/后完整快照
+-- （名称、条款顺序、标题正文、引用、显式移动记录）。撤销即还原 before_snapshot，
+-- 重做即还原 after_snapshot；撤销后产生新编辑会删除 seq 更大的记录（舍弃重做分支）。
+CREATE TABLE IF NOT EXISTS draft_operations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  draft_id INTEGER NOT NULL REFERENCES drafts(id),
+  seq INTEGER NOT NULL,                       -- 草案内连续递增的操作序号（1 起）
+  kind TEXT NOT NULL,                         -- clause-add | clause-edit | clause-delete | clause-move | ref-add | ref-delete | rename
+  summary TEXT NOT NULL,                      -- 人类可读摘要
+  detail TEXT NOT NULL DEFAULT '{}',          -- 操作细节（条款标识、旧/新位置等）
+  created_at TEXT NOT NULL,
+  before_snapshot TEXT NOT NULL,              -- 操作前草案完整快照（规范化 JSON）
+  after_snapshot TEXT NOT NULL,               -- 操作后草案完整快照（规范化 JSON）
+  UNIQUE (draft_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_ops_draft ON draft_operations(draft_id, seq);
 
 CREATE TABLE IF NOT EXISTS draft_clauses (
   draft_id INTEGER NOT NULL REFERENCES drafts(id),
@@ -121,6 +139,7 @@ function migrate(db) {
   };
   addColumnIfMissing('versions', 'moved_keys', "moved_keys TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing('drafts', 'moved_keys', "moved_keys TEXT NOT NULL DEFAULT '[]'");
+  addColumnIfMissing('drafts', 'revision', 'revision INTEGER NOT NULL DEFAULT 0');
   addColumnIfMissing('versions', 'effective_at', 'effective_at TEXT');
   addColumnIfMissing('versions', 'schedule_status', "schedule_status TEXT NOT NULL DEFAULT 'immediate'");
   addColumnIfMissing('meta', 'schedule_revision', 'schedule_revision INTEGER NOT NULL DEFAULT 0');
@@ -199,7 +218,7 @@ function listDrafts(db) {
 
 function getDraftMeta(db, draftId) {
   const row = db
-    .prepare('SELECT id, name, baseline_id, created_at, updated_at, status, moved_keys FROM drafts WHERE id = ?')
+    .prepare('SELECT id, name, baseline_id, created_at, updated_at, status, moved_keys, revision FROM drafts WHERE id = ?')
     .get(draftId);
   if (row) row.moved_keys = JSON.parse(row.moved_keys || '[]');
   return row;
@@ -210,12 +229,76 @@ function loadDraftMoved(db, draftId) {
   return new Set(row ? JSON.parse(row.moved_keys || '[]') : []);
 }
 
-function saveDraftMoved(db, draftId, movedSet) {
-  db.prepare('UPDATE drafts SET moved_keys = ?, updated_at = ? WHERE id = ?').run(
-    JSON.stringify([...movedSet]),
+// ---------------------------------------------------------------------------
+// 草案操作历史 / 撤销重做（调用方负责事务）
+// 快照结构（规范化 JSON）：
+//   { name, moved: [key...], order: [key...],
+//     clauses: [{key,title,body}...], refs: [{source,target,label}...] }
+// ---------------------------------------------------------------------------
+function insertDraftOperation(db, op) {
+  db.prepare(
+    `INSERT INTO draft_operations
+       (draft_id, seq, kind, summary, detail, created_at, before_snapshot, after_snapshot)
+     VALUES (?,?,?,?,?,?,?,?)`,
+  ).run(
+    op.draftId,
+    op.seq,
+    op.kind,
+    op.summary,
+    JSON.stringify(op.detail || {}),
     nowIso(),
+    op.beforeSnapshot,
+    op.afterSnapshot,
+  );
+}
+
+// 撤销后产生新编辑：舍弃重做分支（删除 seq 及以后的操作记录）。
+function truncateDraftOperations(db, draftId, fromSeq) {
+  db.prepare('DELETE FROM draft_operations WHERE draft_id = ? AND seq >= ?').run(draftId, fromSeq);
+}
+
+function listDraftOperations(db, draftId) {
+  return db
+    .prepare('SELECT id, seq, kind, summary, detail, created_at FROM draft_operations WHERE draft_id = ? ORDER BY seq')
+    .all(draftId)
+    .map((row) => ({ ...row, detail: JSON.parse(row.detail || '{}') }));
+}
+
+function getDraftOperation(db, draftId, seq) {
+  const row = db
+    .prepare(
+      'SELECT id, seq, kind, summary, detail, created_at, before_snapshot, after_snapshot FROM draft_operations WHERE draft_id = ? AND seq = ?',
+    )
+    .get(draftId, seq);
+  if (!row) return null;
+  row.detail = JSON.parse(row.detail || '{}');
+  row.before = JSON.parse(row.before_snapshot);
+  row.after = JSON.parse(row.after_snapshot);
+  return row;
+}
+
+// 用快照整体还原草案：名称、条款顺序、标题正文、引用、显式移动记录一并恢复。
+// 同时写入新的修订号（调用方决定 +/-1）并刷新 updated_at。
+function restoreDraftSnapshot(db, draftId, snap, revision) {
+  const ts = nowIso();
+  const state = {
+    order: snap.order,
+    clauses: new Map(snap.clauses.map((c) => [c.key, c])),
+    edges: snap.refs.map((e) => ({ source: e.source, target: e.target, label: e.label || '' })),
+  };
+  replaceDraftContent(db, draftId, state);
+  db.prepare('UPDATE drafts SET name = ?, moved_keys = ?, revision = ?, updated_at = ? WHERE id = ?').run(
+    snap.name,
+    JSON.stringify(snap.moved || []),
+    revision,
+    ts,
     draftId,
   );
+}
+
+function getDraftRevision(db, draftId) {
+  const row = db.prepare('SELECT revision AS r FROM drafts WHERE id = ?').get(draftId);
+  return row ? row.r : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +436,12 @@ module.exports = {
   snapshotDraft,
   replaceDraftContent,
   loadDraftMoved,
-  saveDraftMoved,
+  insertDraftOperation,
+  truncateDraftOperations,
+  listDraftOperations,
+  getDraftOperation,
+  restoreDraftSnapshot,
+  getDraftRevision,
   getScheduleRevision,
   bumpScheduleRevision,
   insertPreviewToken,

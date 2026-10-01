@@ -42,6 +42,7 @@ function run(suite) {
 }
 
 async function main() {
+  let server3 = null;
   try {
     await waitForServer();
     await run('e2e.js');
@@ -61,12 +62,23 @@ async function main() {
     } finally {
       server2.kill();
     }
+    await new Promise((r) => setTimeout(r, 300));
+    fs.rmSync(tmpDb, { force: true });
+    for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
+    server3 = spawn(process.execPath, [path.join(root, 'src/server.js')], {
+      cwd: root,
+      env: { ...process.env, DB_PATH: tmpDb, PORT: port },
+      stdio: ['ignore', 'inherit', 'inherit'],
+    });
+    await new Promise((r) => setTimeout(r, 600));
+    await run('history.e2e.js');
     console.log('\n端到端测试全部通过');
   } catch (err) {
     console.error(err.message);
     server.kill();
     process.exit(1);
   } finally {
+    if (server3) server3.kill();
     fs.rmSync(tmpDb, { force: true });
     for (const ext of ['-wal', '-shm']) fs.rmSync(tmpDb + ext, { force: true });
   }

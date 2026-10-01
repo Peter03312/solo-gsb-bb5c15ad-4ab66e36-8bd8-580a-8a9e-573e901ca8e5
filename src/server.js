@@ -15,7 +15,12 @@ const {
   snapshotDraft,
   replaceDraftContent,
   loadDraftMoved,
-  saveDraftMoved,
+  insertDraftOperation,
+  truncateDraftOperations,
+  listDraftOperations,
+  getDraftOperation,
+  restoreDraftSnapshot,
+  getDraftRevision,
   getScheduleRevision,
   bumpScheduleRevision,
   insertPreviewToken,
@@ -321,6 +326,7 @@ function draftDetail(draftId, { withTextDiff = false } = {}) {
     issues,
     publishable: !hasBlockingIssues(issues),
     diff: summarizeDiff(diff),
+    history: historyPayload(draftId, meta),
   };
   if (withTextDiff) {
     detail.diff.changed_detail = diff.changed.map((c) => {
@@ -354,7 +360,22 @@ function summarizeDiff(diff) {
 // ---------------------------------------------------------------------------
 // 草案编辑
 // ---------------------------------------------------------------------------
-// fn(state, movedSet) 可直接修改条款状态与显式移动集合
+// ---------------------------------------------------------------------------
+// 草案编辑（每次成功编辑形成持久操作记录，可逐步撤销/重做）
+// ---------------------------------------------------------------------------
+function toSnapObj({ name, state, movedSet }) {
+  return {
+    name,
+    moved: [...movedSet],
+    order: state.order,
+    clauses: state.order.map((k) => state.clauses.get(k)),
+    refs: state.edges,
+  };
+}
+
+// fn(state, movedSet) 可直接修改条款状态与显式移动集合；返回 { kind, summary, detail,
+// rename? } 表示一次需记录的编辑。校验失败返回 { error, payload, status }；
+// 操作后草案无任何变化（空操作）则不写草案、不产生记录。
 function mutateDraft(draftId, fn) {
   const meta = getDraftMeta(db, draftId);
   if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
@@ -363,13 +384,41 @@ function mutateDraft(draftId, fn) {
   }
   const state = loadDraftState(db, draftId);
   const movedSet = new Set(meta.moved_keys);
+  // 先序列化操作前快照——state 随后会被 fn 原地修改，必须在调用前留存
+  const beforeObj = toSnapObj({ name: meta.name, state, movedSet });
+  const beforeJson = JSON.stringify(beforeObj);
   const result = fn(state, movedSet);
   if (result && result.error) return { status: result.status || 400, payload: result.payload };
   // 移动记录只保留存活条款
   for (const k of [...movedSet]) if (!state.clauses.has(k)) movedSet.delete(k);
+  const afterSnap = { name: (result && result.rename) || meta.name, state, movedSet };
+  const afterObj = toSnapObj(afterSnap);
+
+  // 无变化：不写库、不产生历史记录
+  if (beforeJson === JSON.stringify(afterObj)) {
+    return { status: 200, payload: draftDetail(draftId) };
+  }
+
+  const op = result && result.kind ? result : { kind: 'edit', summary: '编辑草案', detail: {} };
   const tx = db.transaction(() => {
     replaceDraftContent(db, draftId, state);
-    saveDraftMoved(db, draftId, movedSet);
+    db.prepare('UPDATE drafts SET name = ?, moved_keys = ?, revision = revision + 1, updated_at = ? WHERE id = ?').run(
+      afterSnap.name,
+      JSON.stringify([...movedSet]),
+      nowIso(),
+      draftId,
+    );
+    // 撤销之后再做新编辑：重做分支（seq >= 当前 revision+1）整体舍弃
+    truncateDraftOperations(db, draftId, meta.revision + 1);
+    insertDraftOperation(db, {
+      draftId,
+      seq: meta.revision + 1,
+      kind: op.kind,
+      summary: op.summary,
+      detail: op.detail || {},
+      beforeSnapshot: beforeJson,
+      afterSnapshot: JSON.stringify(afterObj),
+    });
   });
   tx();
   return { status: 200, payload: draftDetail(draftId) };
@@ -389,15 +438,22 @@ function draftRoutes(method, url, body, query) {
   if (method === 'PATCH' && sub === '') {
     const meta = getDraftMeta(db, draftId);
     if (!meta) return { status: 404, payload: { error: 'NOT_FOUND' } };
+    if (meta.status !== 'open') {
+      return { status: 409, payload: { error: 'CLOSED', message: '草案已发布，不能再改名' } };
+    }
     const name = String(body.name || '').trim();
     if (!name) return { status: 400, payload: { error: 'VALIDATION', message: '草案名称不能为空' } };
-    db.prepare('UPDATE drafts SET name = ?, updated_at = ? WHERE id = ?').run(
-      name,
-      new Date().toISOString(),
-      draftId,
-    );
-    return { status: 200, payload: draftDetail(draftId) };
+    return mutateDraft(draftId, () => ({
+      kind: 'rename',
+      summary: `草案改名：「${meta.name}」→「${name}」`,
+      detail: { from: meta.name, to: name },
+      rename: name,
+    }));
   }
+
+  if (method === 'GET' && sub === '/history') return handleHistory(draftId);
+  if (method === 'POST' && sub === '/undo') return handleUndoRedo(draftId, body, 'undo');
+  if (method === 'POST' && sub === '/redo') return handleUndoRedo(draftId, body, 'redo');
 
   if (method === 'POST' && sub === '/publish') {
     // 携带预览凭据 -> 凭据确认发布；否则沿用原有直接发布
@@ -428,6 +484,11 @@ function clauseRoutes(method, sub, body, draftId) {
       if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
       state.order.push(key);
       state.clauses.set(key, { key, title, body: text });
+      return {
+        kind: 'clause-add',
+        summary: `新增条款「${key} ${title}」`,
+        detail: { key, title, ordinal: state.order.length - 1 },
+      };
     });
   }
 
@@ -440,23 +501,37 @@ function clauseRoutes(method, sub, body, draftId) {
     return mutateDraft(draftId, (state, movedSet) => {
       if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
       const oldOrder = [...state.order];
-      const idx = state.order.indexOf(key);
+      const oldIndex = state.order.indexOf(key);
+      const idx = oldIndex;
       state.order.splice(idx, 1);
+      let newIndex;
       if (typeof body.ordinal === 'number') {
         const target = Math.max(0, Math.min(body.ordinal, state.order.length));
         state.order.splice(target, 0, key);
+        newIndex = target;
       } else {
         const after = body.after === undefined ? null : String(body.after);
         if (after === null || after === '') {
           state.order.unshift(key);
+          newIndex = 0;
         } else {
           const at = state.order.indexOf(after);
           if (at === -1) return { error: true, payload: { error: 'BAD_ANCHOR', message: '锚点条款不存在' } };
           state.order.splice(at + 1, 0, key);
+          newIndex = at + 1;
         }
       }
       // 只有顺序真的发生变化才记录显式移动
-      if (state.order.some((k, i) => oldOrder[i] !== k)) movedSet.add(key);
+      if (state.order.some((k, i) => oldOrder[i] !== k)) {
+        movedSet.add(key);
+        return {
+          kind: 'clause-move',
+          summary: `移动条款「${key}」：第 ${oldIndex + 1} 位 → 第 ${newIndex + 1} 位`,
+          detail: { key, from: oldIndex, to: newIndex },
+        };
+      }
+      // 位置未变：回到原始顺序（此时 state.order 仍是 splice 后再插回原位，内容无变化）
+      return { kind: 'noop' };
     });
   }
 
@@ -467,16 +542,31 @@ function clauseRoutes(method, sub, body, draftId) {
       if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
       if (!title) return { error: true, payload: { error: 'VALIDATION', message: '标题不能为空' } };
       if (!text.trim()) return { error: true, payload: { error: 'VALIDATION', message: '正文不能为空' } };
+      const old = state.clauses.get(key);
       state.clauses.set(key, { key, title, body: text });
+      return {
+        kind: 'clause-edit',
+        summary:
+          old.title !== title
+            ? `改写条款「${key}」（标题：${old.title} → ${title}）`
+            : `改写条款「${key} ${title}」正文`,
+        detail: { key, old_title: old.title, new_title: title },
+      };
     });
   }
 
   if (method === 'DELETE') {
     return mutateDraft(draftId, (state) => {
       if (!state.clauses.has(key)) return { error: true, payload: { error: 'NOT_FOUND', message: '条款不存在' } };
+      const old = state.clauses.get(key);
       state.order.splice(state.order.indexOf(key), 1);
       // 删除条款：其出边保留在草案中并成为悬空引用（可暂存、阻止发布、可重新建回同标识条款消除）
       state.clauses.delete(key);
+      return {
+        kind: 'clause-delete',
+        summary: `删除条款「${key} ${old.title}」（相关引用保留为悬空）`,
+        detail: { key, title: old.title },
+      };
     });
   }
 
@@ -497,6 +587,11 @@ function refRoutes(method, sub, body, draftId) {
       if (dup) return { error: true, payload: { error: 'DUP_REF', message: '相同引用已存在' } };
       // 允许暂存指向尚不存在条款的引用
       state.edges.push({ source, target, label });
+      return {
+        kind: 'ref-add',
+        summary: `新增引用：${source} → ${target}${label ? `（${label}）` : ''}`,
+        detail: { source, target, label, ordinal: state.edges.length - 1 },
+      };
     });
   }
   const m = sub.match(/^\/refs\/(\d+)$/);
@@ -505,20 +600,109 @@ function refRoutes(method, sub, body, draftId) {
     return mutateDraft(draftId, (state) => {
       if (refOrdinal < 0 || refOrdinal >= state.edges.length)
         return { error: true, payload: { error: 'NOT_FOUND', message: '引用不存在' } };
+      const e = state.edges[refOrdinal];
       state.edges.splice(refOrdinal, 1);
+      return {
+        kind: 'ref-delete',
+        summary: `删除引用：${e.source} → ${e.target}${e.label ? `（${e.label}）` : ''}`,
+        detail: { source: e.source, target: e.target, label: e.label || '', ordinal: refOrdinal },
+      };
     });
   }
   return { status: 404, payload: { error: 'NOT_FOUND' } };
 }
 
 // ---------------------------------------------------------------------------
-// 发布 / 预览 / 凭据确认
+// 草案操作历史 / 撤销 / 重做
 //
-// 三条写路径共用同一套判定（evaluatePublish）：
-//   1) 直接发布  POST /api/drafts/:id/publish                （原有语义不变）
-//   2) 预览      POST /api/drafts/:id/preview                （只存凭据，不写版本、不关草案）
-//   3) 凭据确认  POST /api/drafts/:id/publish {preview_token}（事务内核对全部失效条件后原子发布）
+// 草案修订号 revision 既是乐观锁也是“当前位置游标”：
+//   revision = 已应用到草案的操作条数（操作 seq 1..revision 生效中，
+//   seq > revision 为撤销后保留的重做分支；撤销后产生新编辑会截断重做分支）。
+// 撤销/重做必须携带读取草案时获得的 revision；修订号过期时整次拒绝并返回当前草案。
+// 恢复直接重放完整快照：条款顺序、标题正文、引用、显式移动记录与草案名称一并还原。
+// 恢复属于草案编辑：恢复前取得的预览凭据立即作废；已发布草案不可操作。
 // ---------------------------------------------------------------------------
+function historyPayload(draftId, meta) {
+  const ops = listDraftOperations(db, draftId);
+  const revision = meta ? meta.revision : getDraftRevision(db, draftId);
+  return {
+    revision,
+    total: ops.length,
+    can_undo: revision > 0,
+    can_redo: revision < ops.length,
+    undo_seq: revision > 0 ? revision : null,
+    redo_seq: revision < ops.length ? revision + 1 : null,
+    operations: ops.map((op) => ({
+      seq: op.seq,
+      kind: op.kind,
+      summary: op.summary,
+      detail: op.detail,
+      created_at: op.created_at,
+      active: op.seq <= revision, // false 表示该操作当前已被撤销（位于重做分支）
+    })),
+  };
+}
+
+function handleHistory(draftId) {
+  const meta = getDraftMeta(db, draftId);
+  if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+  return { status: 200, payload: historyPayload(draftId, meta) };
+}
+
+function handleUndoRedo(draftId, body, direction) {
+  const meta = getDraftMeta(db, draftId);
+  if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '草案不存在' } };
+  if (meta.status !== 'open') {
+    return { status: 409, payload: { error: 'CLOSED', message: '草案已发布，不能再撤销或重做' } };
+  }
+  const rev = body && body.revision;
+  if (!Number.isInteger(rev)) {
+    return { status: 400, payload: { error: 'VALIDATION', message: '请携带读取草案时获得的 revision（整数草案修订号）' } };
+  }
+
+  return runImmediate(() => {
+    const current = getDraftRevision(db, draftId);
+    if (rev !== current) {
+      // 修订号过期：拒绝覆盖，响应返回当前草案详情与历史
+      const stale = {
+        error: 'STALE_DRAFT_REVISION',
+        message: `草案修订号已过期（携带 ${rev}，当前 ${current}），操作未执行；请以返回的当前草案为准后重试。`,
+        draft: draftDetail(draftId),
+        history: historyPayload(draftId),
+      };
+      return { status: 409, payload: stale };
+    }
+
+    const seq = direction === 'undo' ? current : current + 1;
+    const op = getDraftOperation(db, draftId, seq);
+    if (!op) {
+      const code = direction === 'undo' ? 'NOTHING_TO_UNDO' : 'NOTHING_TO_REDO';
+      return {
+        status: 409,
+        payload: { error: code, message: direction === 'undo' ? '没有可撤销的操作' : '没有可重做的操作', history: historyPayload(draftId) },
+      };
+    }
+    const snap = direction === 'undo' ? op.before : op.after;
+    const newRevision = direction === 'undo' ? current - 1 : current + 1;
+    restoreDraftSnapshot(db, draftId, snap, newRevision);
+    // 恢复前取得的预览凭据必须失效（草案内容或名称已变化）。
+    supersedePreviewTokens(db, draftId);
+    const detail = draftDetail(draftId);
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        action: direction,
+        seq,
+        operation: { seq: op.seq, kind: op.kind, summary: op.summary, created_at: op.created_at },
+        revision: newRevision,
+        draft: detail,
+        history: historyPayload(draftId, { revision: newRevision }),
+      },
+    };
+  });
+}
+
 
 // 在 BEGIN IMMEDIATE 事务中执行：与并发发布/预览串行化，保证读集合可重复、写操作原子。
 // 2xx 提交，其余回滚。
